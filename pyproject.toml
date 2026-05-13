@@ -67,7 +67,7 @@ exclude = [
 include-package-data = true
 
 [tool.setuptools.package-data]
-km2arec = ["py.typed"]
+km2arec = ["py.typed", "data/*.txt"]
 
 [tool.setuptools.dynamic]
 version = {attr = "km2arec.version.VERSION"}

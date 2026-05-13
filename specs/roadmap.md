@@ -196,24 +196,100 @@ Tests:
 
 ---
 
-## Phase 2 — Geometry & calibration
+## Phase 2 — Geometry
 
-**Goal:** Load detector layout and bad-detector masks; expose position lookup by detector ID.
+**Goal:** Load detector layout; expose position lookup and a hit-masking helper that filters out hits from detectors absent in the loaded geometry.
+
+> **Calibration / detector status** is deferred to a later phase. The details of the status file format and bad-detector masking are not yet fully understood and will be specified once clarified.
+
+### Geometry design rationale
+
+KM2A is now fully built. The canonical full-array layout files (`ED_pos_all.txt`, `MD_pos_all.txt`) — corresponding to `Flag==7` ("KM2A_all for MC") in the C++ code — are bundled as package data under `km2arec/data/`. By default `load_geometry()` uses these bundled files, so no arguments are needed for the common case. External files can be supplied to support special studies (sub-array analyses, future upgrades, custom MC layouts).
+
+The C++ `arrayflag` integer (which selected one of many partial-build layout files) is **not** part of this Python interface. If sub-array geometry files are ever needed they can simply be passed as explicit paths.
+
+### File format
+
+Both position files share the same structure (verified from `G4KM2A_Geometry.cc`):
+
+- **First line (header):**
+  - ED files: `Rotation <deg> deg zeroZ <zeroZ_m>` — rotation angle (unused by the reader) and reference altitude.
+  - MD files: `zeroZ <zeroZ_m>` — only the reference altitude.
+- **Data rows:** `id  lhaaso_x  lhaaso_y  z` — all coordinates are in the **LHAASO frame**. The transformation to CORSIKA frame is:
+  ```
+  x_corsika =  lhaaso_y   (3rd column)
+  y_corsika = -lhaaso_x   (2nd column, negated)
+  z_corsika =  z - zeroZ  (4th column minus header value)
+  ```
+  `load_geometry` applies this transformation so all returned coordinates are already in the CORSIKA frame.
+
+### In-memory representation
+
+`load_geometry()` returns a `GeometryArrays` — a plain `NamedTuple` (not a dataclass, no methods) with two fields `ed` and `md`, each an `ak.Array` with fields `id`, `x`, `y`, `z`. Because ED (5216 entries) and MD (1188 entries) have different lengths they cannot share a single outer `ak.Array`, but the `NamedTuple` wrapper gives identical dotted-access ergonomics:
+
+```python
+geo = load_geometry()
+geo.ed.x   # ak.Array of CORSIKA x positions of all ED detectors
+geo.md.id  # ak.Array of detector IDs of all MD detectors
+```
+
+### Hit masking by geometry presence
+
+When the loaded geometry is a sub-array (partial layout), or when hits reference non-instrumented IDs, those hits must be excluded from reconstruction.
+
+#### Design principle: inputs stay pristine
+
+In the data-driven design, simulation events are **read-only**. The geometry filter is a reconstruction decision, not a property of the event itself. The `status` field in the ROOT file is the simulator's (G4KM2A) assessment of hit quality; overwriting it with a reconstruction-time choice — even functionally, returning a new array — conflates two separate concerns:
+
+- *Simulation quality* — was this hit physically real? (set by G4KM2A, encoded in `status`)
+- *Geometry coverage* — is this detector in the loaded layout? (a reconstruction decision)
+
+The correct pattern is to compose the geometry mask with the status predicate **at numpy-extraction time** inside the pipeline, without touching the event arrays:
+
+```python
+ed_lookup = build_id_lookup(geo.ed.id)   # built once at startup
+
+# per event, inside the pipeline — original event arrays untouched:
+hit_ids = ak.to_numpy(events.ed_hits.id[i])
+status  = ak.to_numpy(events.ed_hits.status[i])
+mask = active_hits(hit_ids, ed_lookup) & (status > 0)
+# use hit_ids[mask], times[mask], pe[mask], ... for reconstruction
+```
+
+#### `mark_missing_hits` — opt-in annotation utility (not the pipeline path)
+
+`mark_missing_hits` is provided for cases where a user explicitly wants to persist a geometry-annotated copy of a dataset (diagnostics, pre-filtering a large file before reconstruction). It is **not called by the pipeline**. Callers should be aware that the returned array's `status` field no longer faithfully reflects the simulation output alone.
+
+#### Why not Numba JIT?
+
+Numba is worthwhile when a computation cannot be expressed as vectorised NumPy. Here the core operation is a single fancy-index (`lookup[hit_ids]`), which already runs at C speed. The JIT compilation overhead (~1–2 s on first call) would dominate the actual work for typical hit multiplicities (≲ 1000 hits/event). Numba can be reconsidered if profiling later identifies this as a real bottleneck.
 
 Files:
-- `km2arec/geometry.py` — `load_geometry(arrayflag, config_dir) -> GeometryTable`
-  - Reads `ED_pos_*.txt` / `MD_pos_*.txt` from `config/`
-  - Returns a dataclass with arrays `detector_id`, `x`, `y`, `z` for ED and MD separately
-  - `arrayflag` selects which layout file to use (matching C++ `arrayflag` CLI argument)
-- `km2arec/calibration.py` — `load_calibration(status_file) -> CalibrationMask`
-  - Reads detector status text file
-  - Returns a boolean mask array indexed by detector ID (True = good)
+- `km2arec/geometry.py`:
+  - `load_geometry(ed_pos_file=None, md_pos_file=None) -> GeometryArrays`
+    - If `ed_pos_file` / `md_pos_file` are `None`, uses the bundled `km2arec/data/ED_pos_all.txt` and `km2arec/data/MD_pos_all.txt` (5216 ED + 1188 MD, full KM2A array).
+    - Accepts `str | Path` for either argument to override with an external file.
+    - Returns coordinates in CORSIKA frame.
+  - `build_id_lookup(ids: ak.Array) -> np.ndarray`
+    - Accepts the `id` field of either `geo.ed` or `geo.md`.
+    - Returns a `np.ndarray[bool]` of length `max(ids) + 1`; index `i` is `True` iff detector `i` is present in the geometry.
+  - `active_hits(hit_ids: np.ndarray, lookup: np.ndarray) -> np.ndarray`
+    - **Pipeline-facing function.** Given a 1-D numpy array of hit IDs for one event and a lookup array, returns a boolean mask. IDs exceeding `len(lookup) - 1` are treated as absent. Compose with a status predicate to get the combined per-event selection mask.
+  - `mark_missing_hits(hits: ak.Array, lookup: np.ndarray, absent_status: int = -2) -> ak.Array`
+    - **Annotation utility only; not used by the pipeline.** Returns a new array with `status = absent_status` for geometry-absent hits across all events. Use for diagnostic or pre-filtering workflows where explicitly marking geometry-absent hits in persistent data is intentional.
+- `km2arec/data/ED_pos_all.txt` — bundled full ED array layout (5216 detectors, `Flag==7`).
+- `km2arec/data/MD_pos_all.txt` — bundled full MD array layout (1188 detectors).
 
 Tests:
-- `tests/test_geometry.py`: known detector IDs map to expected (x, y, z) coordinates.
-- `tests/test_calibration.py`: bad detectors in a sample status file are correctly masked.
+- `tests/test_geometry.py`:
+  - Default (no args) loads 5216 ED detectors and 1188 MD detectors.
+  - Known detector IDs map to expected (x, y, z) coordinates in CORSIKA frame.
+  - External file path override works for both ED and MD independently.
+  - `build_id_lookup`: correct length, correct True/False for known IDs.
+  - `active_hits`: masks absent and out-of-range IDs; passes present IDs.
+  - `mark_missing_hits`: present IDs keep original status; absent and out-of-range IDs get `status = -2`; custom `absent_status` works; ragged structure is preserved.
 
-**Exit criteria:** Can look up any detector's position and status by ID without ROOT.
+**Exit criteria:** Can look up any detector's position by ID without ROOT; `load_geometry()` with no arguments returns a `GeometryArrays` with 5216 ED and 1188 MD detectors; `active_hits` is the pipeline-facing filter, composing with the status predicate at numpy-extraction time.
 
 ---
 
@@ -306,19 +382,21 @@ Tests:
 
 Files:
 - `km2arec/pipeline.py`:
-  - `eventrecline(hits_ed, hits_md, geometry, calibration, **options) -> dict`
+  - `eventrecline(hits_ed, hits_md, geometry, **options) -> dict`
     - Calls trigger → spacetimefilter → planarfit → core_centre2 → conicalfit → noisefilter → core_likelihood (ED only) → observables (ED counts + raw MD muon counts)
     - Returns a flat dict of all reconstructed quantities (one event at a time)
-  - `reconstruct_file(in_path, out_path, arrayflag, status_file, time_resolution=0.0)`
+    - `geometry` is the `ak.Array` returned by `load_geometry()`
+  - `reconstruct_file(in_path, out_path, time_resolution=0.0, ed_pos_file=None, md_pos_file=None)`
     - Iterates over all events; accumulates per-event result dicts into a flat awkward array; calls `write_rec`
 - `km2arec/__main__.py`:
   - CLI entry point via `python -m km2arec`
-  - Arguments mirror the C++ interface: `arrayflag outfile timecalibrationresolution maskdetector in_file [in_file ...]`
+  - Required positional arguments: `outfile timecalibrationresolution in_file [in_file ...]`
+  - Optional geometry overrides: `--ed-pos ED_POS_FILE` and `--md-pos MD_POS_FILE`; when omitted, the bundled full-array geometry is used automatically.
 
 Tests:
 - `tests/test_pipeline.py`: end-to-end run on `data/km2a_simulation.root`; output ROOT file is opened and reconstructed quantities are compared against the C++ golden reference (stored in `tests/reference/`).
 
-**Exit criteria:** `python -m km2arec 6 out.root 0.0 config/status.txt data/km2a_simulation.root` completes and the output passes the regression test.
+**Exit criteria:** `python -m km2arec out.root 0.0 data/km2a_simulation.root` completes using the default full-array geometry and the output passes the regression test.
 
 ---
 
