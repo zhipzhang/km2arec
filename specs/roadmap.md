@@ -196,24 +196,57 @@ Tests:
 
 ---
 
-## Phase 2 — Geometry & calibration
+## Phase 2 — Geometry
 
-**Goal:** Load detector layout and bad-detector masks; expose position lookup by detector ID.
+**Goal:** Load detector layout; expose position lookup by detector ID as an `ak.Array`.
+
+> **Calibration / detector status** is deferred to a later phase. The details of the status file format and bad-detector masking are not yet fully understood and will be specified once clarified.
+
+### Geometry design rationale
+
+KM2A is now fully built. The canonical full-array layout files (`ED_pos_all.txt`, `MD_pos_all.txt`) — corresponding to `Flag==7` ("KM2A_all for MC") in the C++ code — are bundled as package data under `km2arec/data/`. By default `load_geometry()` uses these bundled files, so no arguments are needed for the common case. External files can be supplied to support special studies (sub-array analyses, future upgrades, custom MC layouts).
+
+The C++ `arrayflag` integer (which selected one of many partial-build layout files) is **not** part of this Python interface. If sub-array geometry files are ever needed they can simply be passed as explicit paths.
+
+### File format
+
+Both position files share the same structure (verified from `G4KM2A_Geometry.cc`):
+
+- **First line (header):**
+  - ED files: `Rotation <deg> deg zeroZ <zeroZ_m>` — rotation angle (unused by the reader) and reference altitude.
+  - MD files: `zeroZ <zeroZ_m>` — only the reference altitude.
+- **Data rows:** `id  lhaaso_x  lhaaso_y  z` — all coordinates are in the **LHAASO frame**. The transformation to CORSIKA frame is:
+  ```
+  x_corsika =  lhaaso_y   (3rd column)
+  y_corsika = -lhaaso_x   (2nd column, negated)
+  z_corsika =  z - zeroZ  (4th column minus header value)
+  ```
+  `load_geometry` applies this transformation so all returned coordinates are already in the CORSIKA frame.
+
+### In-memory representation
+
+`load_geometry()` returns a `GeometryArrays` — a plain `NamedTuple` (not a dataclass, no methods) with two fields `ed` and `md`, each an `ak.Array` with fields `id`, `x`, `y`, `z`. Because ED (5216 entries) and MD (1188 entries) have different lengths they cannot share a single outer `ak.Array`, but the `NamedTuple` wrapper gives identical dotted-access ergonomics:
+
+```python
+geo = load_geometry()
+geo.ed.x   # ak.Array of CORSIKA x positions of all ED detectors
+geo.md.id  # ak.Array of detector IDs of all MD detectors
+```
+
+Position lookup by detector ID uses `np.where` or `np.searchsorted` on `ak.to_numpy(geo.ed.id)` as needed in downstream stages.
 
 Files:
-- `km2arec/geometry.py` — `load_geometry(arrayflag, config_dir) -> GeometryTable`
-  - Reads `ED_pos_*.txt` / `MD_pos_*.txt` from `config/`
-  - Returns a dataclass with arrays `detector_id`, `x`, `y`, `z` for ED and MD separately
-  - `arrayflag` selects which layout file to use (matching C++ `arrayflag` CLI argument)
-- `km2arec/calibration.py` — `load_calibration(status_file) -> CalibrationMask`
-  - Reads detector status text file
-  - Returns a boolean mask array indexed by detector ID (True = good)
+- `km2arec/geometry.py` — `load_geometry(ed_pos_file=None, md_pos_file=None) -> GeometryArrays`
+  - If `ed_pos_file` / `md_pos_file` are `None`, uses the bundled `km2arec/data/ED_pos_all.txt` and `km2arec/data/MD_pos_all.txt` (5216 ED + 1188 MD, full KM2A array).
+  - Accepts `str | Path` for either argument to override with an external file.
+  - Returns the `ak.Array` described above, with coordinates in CORSIKA frame.
+- `km2arec/data/ED_pos_all.txt` — bundled full ED array layout (5216 detectors, `Flag==7`).
+- `km2arec/data/MD_pos_all.txt` — bundled full MD array layout (1188 detectors).
 
 Tests:
-- `tests/test_geometry.py`: known detector IDs map to expected (x, y, z) coordinates.
-- `tests/test_calibration.py`: bad detectors in a sample status file are correctly masked.
+- `tests/test_geometry.py`: default (no args) loads 5216 ED detectors and 1188 MD detectors; known detector IDs map to expected (x, y, z) coordinates in CORSIKA frame; passing an external file path overrides the default.
 
-**Exit criteria:** Can look up any detector's position and status by ID without ROOT.
+**Exit criteria:** Can look up any detector's position by ID without ROOT; `load_geometry()` with no arguments returns a `GeometryArrays` with 5216 ED and 1188 MD detectors, each as an `ak.Array`.
 
 ---
 
@@ -306,19 +339,21 @@ Tests:
 
 Files:
 - `km2arec/pipeline.py`:
-  - `eventrecline(hits_ed, hits_md, geometry, calibration, **options) -> dict`
+  - `eventrecline(hits_ed, hits_md, geometry, **options) -> dict`
     - Calls trigger → spacetimefilter → planarfit → core_centre2 → conicalfit → noisefilter → core_likelihood (ED only) → observables (ED counts + raw MD muon counts)
     - Returns a flat dict of all reconstructed quantities (one event at a time)
-  - `reconstruct_file(in_path, out_path, arrayflag, status_file, time_resolution=0.0)`
+    - `geometry` is the `ak.Array` returned by `load_geometry()`
+  - `reconstruct_file(in_path, out_path, time_resolution=0.0, ed_pos_file=None, md_pos_file=None)`
     - Iterates over all events; accumulates per-event result dicts into a flat awkward array; calls `write_rec`
 - `km2arec/__main__.py`:
   - CLI entry point via `python -m km2arec`
-  - Arguments mirror the C++ interface: `arrayflag outfile timecalibrationresolution maskdetector in_file [in_file ...]`
+  - Required positional arguments: `outfile timecalibrationresolution in_file [in_file ...]`
+  - Optional geometry overrides: `--ed-pos ED_POS_FILE` and `--md-pos MD_POS_FILE`; when omitted, the bundled full-array geometry is used automatically.
 
 Tests:
 - `tests/test_pipeline.py`: end-to-end run on `data/km2a_simulation.root`; output ROOT file is opened and reconstructed quantities are compared against the C++ golden reference (stored in `tests/reference/`).
 
-**Exit criteria:** `python -m km2arec 6 out.root 0.0 config/status.txt data/km2a_simulation.root` completes and the output passes the regression test.
+**Exit criteria:** `python -m km2arec out.root 0.0 data/km2a_simulation.root` completes using the default full-array geometry and the output passes the regression test.
 
 ---
 
