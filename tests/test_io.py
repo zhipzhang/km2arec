@@ -49,7 +49,7 @@ def _make_dummy_flat_rec(n: int = N_DUMMY) -> ak.Array:
 
 
 @pytest.fixture(scope="module")
-def sim_arrays() -> tuple[ak.Array, ak.Array, ak.Array]:
+def sim_events() -> ak.Array:
     """Read the sample simulation file once for the whole module."""
     return read_events(DATA_ROOT)
 
@@ -68,63 +68,64 @@ def round_trip_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 class TestReadEvents:
-    def test_returns_three_arrays(self, sim_arrays: tuple) -> None:
-        ed_hits, md_hits, truth = sim_arrays
-        assert isinstance(ed_hits, ak.Array)
-        assert isinstance(md_hits, ak.Array)
-        assert isinstance(truth, ak.Array)
+    def test_returns_ak_array(self, sim_events: ak.Array) -> None:
+        assert isinstance(sim_events, ak.Array)
 
-    def test_ed_hits_fields(self, sim_arrays: tuple) -> None:
-        ed_hits, _, _ = sim_arrays
-        assert {"id", "time", "pe", "np", "status"} <= set(ed_hits.fields)
+    def test_top_level_sub_records(self, sim_events: ak.Array) -> None:
+        assert set(sim_events.fields) == {"ed_hits", "md_hits", "simulation"}
 
-    def test_md_hits_fields(self, sim_arrays: tuple) -> None:
-        _, md_hits, _ = sim_arrays
-        assert {"id", "time", "pe", "np", "status"} <= set(md_hits.fields)
+    def test_ed_hits_fields(self, sim_events: ak.Array) -> None:
+        assert {"id", "time", "pe", "np", "status"} <= set(sim_events.ed_hits.fields)
 
-    def test_truth_fields(self, sim_arrays: tuple) -> None:
-        _, _, truth = sim_arrays
-        assert {"energy", "id", "theta", "phi", "corex", "corey", "NpE", "NuM"} <= set(truth.fields)
+    def test_md_hits_fields(self, sim_events: ak.Array) -> None:
+        assert {"id", "time", "pe", "np", "status"} <= set(sim_events.md_hits.fields)
 
-    def test_ed_hits_are_ragged(self, sim_arrays: tuple) -> None:
-        ed_hits, _, _ = sim_arrays
+    def test_simulation_fields(self, sim_events: ak.Array) -> None:
+        assert {"energy", "id", "theta", "phi", "corex", "corey", "NpE", "NuM"} <= set(
+            sim_events.simulation.fields
+        )
+
+    def test_ed_hits_are_ragged(self, sim_events: ak.Array) -> None:
         # Each element is itself an array of hits, not a scalar
-        assert isinstance(ed_hits["time"][0], ak.Array)
+        assert isinstance(sim_events.ed_hits.time[0], ak.Array)
 
-    def test_md_hits_are_ragged(self, sim_arrays: tuple) -> None:
-        _, md_hits, _ = sim_arrays
-        assert isinstance(md_hits["time"][0], ak.Array)
+    def test_md_hits_are_ragged(self, sim_events: ak.Array) -> None:
+        assert isinstance(sim_events.md_hits.time[0], ak.Array)
 
-    def test_truth_is_flat(self, sim_arrays: tuple) -> None:
-        _, _, truth = sim_arrays
-        # truth["energy"] is a 1-D array (one value per event)
-        assert truth["energy"].ndim == 1
+    def test_simulation_is_flat(self, sim_events: ak.Array) -> None:
+        # simulation.energy is a 1-D array (one value per event)
+        assert sim_events.simulation.energy.ndim == 1
 
-    def test_truth_energy_positive(self, sim_arrays: tuple) -> None:
-        _, _, truth = sim_arrays
-        assert ak.all(truth["energy"] > 0)
+    def test_simulation_energy_positive(self, sim_events: ak.Array) -> None:
+        assert ak.all(sim_events.simulation.energy > 0)
 
-    def test_event_count_consistent(self, sim_arrays: tuple) -> None:
-        ed_hits, md_hits, truth = sim_arrays
-        assert len(ed_hits) == len(md_hits) == len(truth)
+    def test_event_count_consistent(self, sim_events: ak.Array) -> None:
+        n = len(sim_events)
+        assert len(sim_events.ed_hits) == n
+        assert len(sim_events.md_hits) == n
+        assert len(sim_events.simulation.energy) == n
 
-    def test_ed_hit_count_matches_nhite(self, sim_arrays: tuple) -> None:
-        """len(ed_hits["id"][i]) must equal the NhitE stored in the file."""
+    def test_ed_hit_count_matches_nhite(self, sim_events: ak.Array) -> None:
+        """len(ed_hits.id[i]) must equal the NhitE stored in the file."""
         import uproot
 
-        ed_hits, _, _ = sim_arrays
         with uproot.open(DATA_ROOT) as f:
             nhit_e = f["event"].arrays(["NhitE"], library="ak")["NhitE"]
-        for i in range(len(ed_hits)):
-            assert len(ed_hits["id"][i]) == nhit_e[i]
+        for i in range(len(sim_events)):
+            assert len(sim_events.ed_hits.id[i]) == nhit_e[i]
 
-    def test_ed_time_dtype_is_float(self, sim_arrays: tuple) -> None:
-        ed_hits, _, _ = sim_arrays
-        assert ak.type(ed_hits["time"]).content.content.primitive == "float64"  # type: ignore[attr-defined]
+    def test_ed_time_dtype_is_float(self, sim_events: ak.Array) -> None:
+        assert ak.type(sim_events.ed_hits.time).content.content.primitive == "float64"  # type: ignore[attr-defined]
 
-    def test_ed_id_dtype_is_int(self, sim_arrays: tuple) -> None:
-        ed_hits, _, _ = sim_arrays
-        assert "int" in str(ak.type(ed_hits["id"]))
+    def test_ed_id_dtype_is_int(self, sim_events: ak.Array) -> None:
+        assert "int" in str(ak.type(sim_events.ed_hits.id))
+
+    def test_event_filter_propagates(self, sim_events: ak.Array) -> None:
+        """Boolean masking at the top level must propagate into sub-records."""
+        mask = sim_events.simulation.energy > 1e4
+        filtered = sim_events[mask]
+        assert len(filtered) <= len(sim_events)
+        _ = filtered.ed_hits.time  # sub-record still accessible
 
 
 # ---------------------------------------------------------------------------

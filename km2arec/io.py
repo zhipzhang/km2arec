@@ -100,8 +100,23 @@ REC_FIELDS: list[str] = [
 # ---------------------------------------------------------------------------
 
 
-def read_events(path: PathLike) -> tuple[ak.Array, ak.Array, ak.Array]:
+def read_events(path: PathLike) -> ak.Array:
     """Read the ``event`` TTree from a G4KM2A simulation ROOT file.
+
+    Returns a single record array (one entry per event) with three
+    named sub-records:
+
+    ``ed_hits``
+        Ragged sub-array of ED hits per event.
+        Fields: ``id`` (int), ``time`` (ns, float), ``pe`` (float),
+        ``np`` (int), ``status`` (int, 5=good / -1=bad detector).
+    ``md_hits``
+        Ragged sub-array of MD (Muon Detector) hits per event.
+        Same fields as ``ed_hits``.
+    ``simulation``
+        Flat MC truth scalars, one value per event.
+        Fields: ``energy`` (TeV), ``id``, ``theta`` (rad), ``phi`` (rad),
+        ``corex`` (m), ``corey`` (m), ``NpE``, ``NuM``.
 
     Parameters
     ----------
@@ -109,18 +124,12 @@ def read_events(path: PathLike) -> tuple[ak.Array, ak.Array, ak.Array]:
         Path to a ROOT file produced by G4KM2A.  The file must contain a
         TTree named ``event`` with ``LHEvent``/``LHHit`` objects.
 
-    Returns
-    -------
-    ed_hits:
-        Ragged record array — one sub-array of hits per event.
-        Fields: ``id`` (int), ``time`` (ns, float), ``pe`` (float),
-        ``np`` (int), ``status`` (int, 5=good / -1=bad detector).
-    md_hits:
-        Same structure for Muon Detector hits.
-    truth:
-        Flat record array — one scalar per event (MC truth).
-        Fields: ``energy`` (TeV), ``id``, ``theta`` (rad), ``phi`` (rad),
-        ``corex`` (m), ``corey`` (m), ``NpE``, ``NuM``.
+    Examples
+    --------
+    >>> events = read_events("data/km2a_simulation.root")
+    >>> events.ed_hits.time[0]       # ED hit times for event 0 (ragged)
+    >>> events.md_hits.id[0]         # MD hit detector IDs for event 0
+    >>> events.simulation.energy     # true primary energies (flat, all events)
     """
     with uproot.open(path) as f:
         tree = f["event"]
@@ -149,7 +158,7 @@ def read_events(path: PathLike) -> tuple[ak.Array, ak.Array, ak.Array]:
         }
     )
 
-    truth = ak.zip(
+    simulation = ak.zip(
         {
             "energy": data["E"],  # TeV
             "id": data["Id"],  # particle type (PDG-like code)
@@ -162,7 +171,12 @@ def read_events(path: PathLike) -> tuple[ak.Array, ak.Array, ak.Array]:
         }
     )
 
-    return ed_hits, md_hits, truth
+    # depth_limit=1 merges at the event level without broadcasting into
+    # the inner ragged hit arrays.
+    return ak.zip(
+        {"ed_hits": ed_hits, "md_hits": md_hits, "simulation": simulation},
+        depth_limit=1,
+    )
 
 
 def write_rec(path: PathLike, flat_rec: ak.Array) -> None:

@@ -185,7 +185,7 @@ The flat ↔ structured conversion is the only logic in `read_rec` / `write_rec`
 
 Files:
 - `km2arec/io.py`:
-  - `read_events(path) -> tuple[ak.Array, ak.Array, ak.Array]` — returns `(ed_hits, md_hits, truth)`
+  - `read_events(path) -> ak.Array` — returns a single record with three sub-records: `ed_hits`, `md_hits`, `simulation`; uses `depth_limit=1` to merge at the event level without broadcasting into ragged hit arrays
   - `write_rec(path, flat_rec)` — writes the flat `ak.zip` as TTree `Rec`
   - `read_rec(path) -> ak.Array` — reads TTree `Rec` and returns the structured nested record
 
