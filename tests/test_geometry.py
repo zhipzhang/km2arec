@@ -8,7 +8,7 @@ import awkward as ak
 import numpy as np
 import pytest
 
-from km2arec.geometry import GeometryArrays, load_geometry
+from km2arec.geometry import GeometryArrays, active_hits, build_id_lookup, load_geometry, mark_missing_hits
 
 # ---------------------------------------------------------------------------
 # Reference values derived from the first data rows of each bundled file
@@ -169,3 +169,145 @@ class TestExternalFile:
     def test_missing_file_raises(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError):
             load_geometry(ed_pos_file=tmp_path / "nonexistent.txt")
+
+
+# ---------------------------------------------------------------------------
+# Group 4: build_id_lookup
+# ---------------------------------------------------------------------------
+
+
+class TestBuildIdLookup:
+    def test_length_is_max_id_plus_one(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.ed.id)
+        max_id = int(ak.to_numpy(geo.ed.id).max())
+        assert len(lookup) == max_id + 1
+
+    def test_known_present_id(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.ed.id)
+        assert lookup[_ED_REF_ID] is np.bool_(True)
+
+    def test_id_zero_absent(self, geo: GeometryArrays) -> None:
+        # detector ID 0 does not exist in the KM2A layout
+        lookup = build_id_lookup(geo.ed.id)
+        assert lookup[0] is np.bool_(False)
+
+    def test_md_lookup_length(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.md.id)
+        max_id = int(ak.to_numpy(geo.md.id).max())
+        assert len(lookup) == max_id + 1
+
+    def test_md_known_present_id(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.md.id)
+        assert lookup[_MD_REF_ID] is np.bool_(True)
+
+    def test_returns_bool_dtype(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.ed.id)
+        assert lookup.dtype == bool
+
+
+# ---------------------------------------------------------------------------
+# Group 5: active_hits
+# ---------------------------------------------------------------------------
+
+
+class TestActiveHits:
+    def test_all_present_ids_pass(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.ed.id)
+        ed_ids = ak.to_numpy(geo.ed.id)
+        mask = active_hits(ed_ids, lookup)
+        assert mask.all()
+
+    def test_absent_id_is_masked(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.ed.id)
+        # ID 0 is never in the geometry
+        hit_ids = np.array([0, _ED_REF_ID], dtype=np.int32)
+        mask = active_hits(hit_ids, lookup)
+        assert not mask[0]
+        assert mask[1]
+
+    def test_out_of_range_id_is_masked(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.ed.id)
+        huge_id = len(lookup) + 9999
+        hit_ids = np.array([_ED_REF_ID, huge_id], dtype=np.int32)
+        mask = active_hits(hit_ids, lookup)
+        assert mask[0]
+        assert not mask[1]
+
+    def test_empty_hit_array(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.ed.id)
+        mask = active_hits(np.array([], dtype=np.int32), lookup)
+        assert mask.shape == (0,)
+        assert mask.dtype == bool
+
+    def test_output_length_matches_input(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.ed.id)
+        hit_ids = ak.to_numpy(geo.ed.id)[:10]
+        assert len(active_hits(hit_ids, lookup)) == len(hit_ids)
+
+
+# ---------------------------------------------------------------------------
+# Group 6: mark_missing_hits
+# ---------------------------------------------------------------------------
+
+_ABSENT_STATUS = -2
+
+
+def _make_hits(ids: list[list[int]], statuses: list[list[int]]) -> ak.Array:
+    """Build a minimal ragged hit array with ``id`` and ``status`` fields."""
+    return ak.zip(
+        {
+            "id": ak.Array(ids),
+            "status": ak.Array(statuses),
+        },
+        depth_limit=1,
+    )
+
+
+class TestMarkMissingHits:
+    def test_present_ids_keep_original_status(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.ed.id)
+        # Use two known-present IDs with status=5
+        hits = _make_hits([[_ED_REF_ID, _ED_REF_ID]], [[5, 5]])
+        result = mark_missing_hits(hits, lookup)
+        assert ak.to_numpy(result.status[0]).tolist() == [5, 5]
+
+    def test_absent_id_gets_absent_status(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.ed.id)
+        # ID 0 is not in the geometry
+        hits = _make_hits([[0, _ED_REF_ID]], [[5, 5]])
+        result = mark_missing_hits(hits, lookup)
+        statuses = ak.to_numpy(result.status[0]).tolist()
+        assert statuses[0] == _ABSENT_STATUS
+        assert statuses[1] == 5
+
+    def test_out_of_range_id_gets_absent_status(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.ed.id)
+        huge_id = len(lookup) + 9999
+        hits = _make_hits([[huge_id]], [[5]])
+        result = mark_missing_hits(hits, lookup)
+        assert int(result.status[0][0]) == _ABSENT_STATUS
+
+    def test_custom_absent_status(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.ed.id)
+        hits = _make_hits([[0]], [[-1]])
+        result = mark_missing_hits(hits, lookup, absent_status=-99)
+        assert int(result.status[0][0]) == -99
+
+    def test_all_fields_preserved(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.ed.id)
+        hits = _make_hits([[_ED_REF_ID]], [[5]])
+        result = mark_missing_hits(hits, lookup)
+        assert set(result.fields) == set(hits.fields)
+
+    def test_ragged_structure_preserved(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.ed.id)
+        # Two events with different hit counts
+        hits = _make_hits([[_ED_REF_ID, 0], [_ED_REF_ID]], [[5, 5], [5]])
+        result = mark_missing_hits(hits, lookup)
+        assert ak.num(result.status).tolist() == [2, 1]
+
+    def test_returns_ak_array(self, geo: GeometryArrays) -> None:
+        lookup = build_id_lookup(geo.ed.id)
+        hits = _make_hits([[_ED_REF_ID]], [[5]])
+        result = mark_missing_hits(hits, lookup)
+        assert isinstance(result, ak.Array)

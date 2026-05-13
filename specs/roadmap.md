@@ -198,7 +198,7 @@ Tests:
 
 ## Phase 2 — Geometry
 
-**Goal:** Load detector layout; expose position lookup by detector ID as an `ak.Array`.
+**Goal:** Load detector layout; expose position lookup and a hit-masking helper that filters out hits from detectors absent in the loaded geometry.
 
 > **Calibration / detector status** is deferred to a later phase. The details of the status file format and bad-detector masking are not yet fully understood and will be specified once clarified.
 
@@ -233,20 +233,63 @@ geo.ed.x   # ak.Array of CORSIKA x positions of all ED detectors
 geo.md.id  # ak.Array of detector IDs of all MD detectors
 ```
 
-Position lookup by detector ID uses `np.where` or `np.searchsorted` on `ak.to_numpy(geo.ed.id)` as needed in downstream stages.
+### Hit masking by geometry presence
+
+When the loaded geometry is a sub-array (partial layout), or when hits reference non-instrumented IDs, those hits must be excluded from reconstruction.
+
+#### Design principle: inputs stay pristine
+
+In the data-driven design, simulation events are **read-only**. The geometry filter is a reconstruction decision, not a property of the event itself. The `status` field in the ROOT file is the simulator's (G4KM2A) assessment of hit quality; overwriting it with a reconstruction-time choice — even functionally, returning a new array — conflates two separate concerns:
+
+- *Simulation quality* — was this hit physically real? (set by G4KM2A, encoded in `status`)
+- *Geometry coverage* — is this detector in the loaded layout? (a reconstruction decision)
+
+The correct pattern is to compose the geometry mask with the status predicate **at numpy-extraction time** inside the pipeline, without touching the event arrays:
+
+```python
+ed_lookup = build_id_lookup(geo.ed.id)   # built once at startup
+
+# per event, inside the pipeline — original event arrays untouched:
+hit_ids = ak.to_numpy(events.ed_hits.id[i])
+status  = ak.to_numpy(events.ed_hits.status[i])
+mask = active_hits(hit_ids, ed_lookup) & (status > 0)
+# use hit_ids[mask], times[mask], pe[mask], ... for reconstruction
+```
+
+#### `mark_missing_hits` — opt-in annotation utility (not the pipeline path)
+
+`mark_missing_hits` is provided for cases where a user explicitly wants to persist a geometry-annotated copy of a dataset (diagnostics, pre-filtering a large file before reconstruction). It is **not called by the pipeline**. Callers should be aware that the returned array's `status` field no longer faithfully reflects the simulation output alone.
+
+#### Why not Numba JIT?
+
+Numba is worthwhile when a computation cannot be expressed as vectorised NumPy. Here the core operation is a single fancy-index (`lookup[hit_ids]`), which already runs at C speed. The JIT compilation overhead (~1–2 s on first call) would dominate the actual work for typical hit multiplicities (≲ 1000 hits/event). Numba can be reconsidered if profiling later identifies this as a real bottleneck.
 
 Files:
-- `km2arec/geometry.py` — `load_geometry(ed_pos_file=None, md_pos_file=None) -> GeometryArrays`
-  - If `ed_pos_file` / `md_pos_file` are `None`, uses the bundled `km2arec/data/ED_pos_all.txt` and `km2arec/data/MD_pos_all.txt` (5216 ED + 1188 MD, full KM2A array).
-  - Accepts `str | Path` for either argument to override with an external file.
-  - Returns the `ak.Array` described above, with coordinates in CORSIKA frame.
+- `km2arec/geometry.py`:
+  - `load_geometry(ed_pos_file=None, md_pos_file=None) -> GeometryArrays`
+    - If `ed_pos_file` / `md_pos_file` are `None`, uses the bundled `km2arec/data/ED_pos_all.txt` and `km2arec/data/MD_pos_all.txt` (5216 ED + 1188 MD, full KM2A array).
+    - Accepts `str | Path` for either argument to override with an external file.
+    - Returns coordinates in CORSIKA frame.
+  - `build_id_lookup(ids: ak.Array) -> np.ndarray`
+    - Accepts the `id` field of either `geo.ed` or `geo.md`.
+    - Returns a `np.ndarray[bool]` of length `max(ids) + 1`; index `i` is `True` iff detector `i` is present in the geometry.
+  - `active_hits(hit_ids: np.ndarray, lookup: np.ndarray) -> np.ndarray`
+    - **Pipeline-facing function.** Given a 1-D numpy array of hit IDs for one event and a lookup array, returns a boolean mask. IDs exceeding `len(lookup) - 1` are treated as absent. Compose with a status predicate to get the combined per-event selection mask.
+  - `mark_missing_hits(hits: ak.Array, lookup: np.ndarray, absent_status: int = -2) -> ak.Array`
+    - **Annotation utility only; not used by the pipeline.** Returns a new array with `status = absent_status` for geometry-absent hits across all events. Use for diagnostic or pre-filtering workflows where explicitly marking geometry-absent hits in persistent data is intentional.
 - `km2arec/data/ED_pos_all.txt` — bundled full ED array layout (5216 detectors, `Flag==7`).
 - `km2arec/data/MD_pos_all.txt` — bundled full MD array layout (1188 detectors).
 
 Tests:
-- `tests/test_geometry.py`: default (no args) loads 5216 ED detectors and 1188 MD detectors; known detector IDs map to expected (x, y, z) coordinates in CORSIKA frame; passing an external file path overrides the default.
+- `tests/test_geometry.py`:
+  - Default (no args) loads 5216 ED detectors and 1188 MD detectors.
+  - Known detector IDs map to expected (x, y, z) coordinates in CORSIKA frame.
+  - External file path override works for both ED and MD independently.
+  - `build_id_lookup`: correct length, correct True/False for known IDs.
+  - `active_hits`: masks absent and out-of-range IDs; passes present IDs.
+  - `mark_missing_hits`: present IDs keep original status; absent and out-of-range IDs get `status = -2`; custom `absent_status` works; ragged structure is preserved.
 
-**Exit criteria:** Can look up any detector's position by ID without ROOT; `load_geometry()` with no arguments returns a `GeometryArrays` with 5216 ED and 1188 MD detectors, each as an `ak.Array`.
+**Exit criteria:** Can look up any detector's position by ID without ROOT; `load_geometry()` with no arguments returns a `GeometryArrays` with 5216 ED and 1188 MD detectors; `active_hits` is the pipeline-facing filter, composing with the status predicate at numpy-extraction time.
 
 ---
 

@@ -116,6 +116,112 @@ def _parse_pos_file(path: Path) -> ak.Array:
     )
 
 
+def build_id_lookup(ids: ak.Array) -> np.ndarray:
+    """Build a boolean lookup array for O(1) detector-presence checks.
+
+    Parameters
+    ----------
+    ids:
+        The ``id`` field of ``geo.ed`` or ``geo.md`` (1-D integer ``ak.Array``).
+
+    Returns
+    -------
+    np.ndarray[bool]
+        Array of length ``max(ids) + 1``.  Index ``i`` is ``True`` iff
+        detector ``i`` is present in the geometry.
+
+    Examples
+    --------
+    >>> geo = load_geometry()
+    >>> ed_lookup = build_id_lookup(geo.ed.id)
+    >>> ed_lookup[1]      # True  — detector 1 is in the full array
+    """
+    id_arr = ak.to_numpy(ids).astype(np.int32)
+    lookup = np.zeros(int(id_arr.max()) + 1, dtype=bool)
+    lookup[id_arr] = True
+    return lookup
+
+
+def active_hits(hit_ids: np.ndarray, lookup: np.ndarray) -> np.ndarray:
+    """Return a boolean mask selecting hits whose detector ID is in the geometry.
+
+    Parameters
+    ----------
+    hit_ids:
+        1-D integer array of detector IDs for a single event's hits.
+    lookup:
+        Boolean lookup array produced by :func:`build_id_lookup`.
+
+    Returns
+    -------
+    np.ndarray[bool]
+        Same length as ``hit_ids``.  ``True`` where the detector is present
+        in the geometry; ``False`` for absent IDs and for IDs that exceed
+        ``len(lookup) - 1``.
+
+    Examples
+    --------
+    >>> ed_lookup = build_id_lookup(geo.ed.id)
+    >>> hit_ids = ak.to_numpy(events.ed_hits.id[0])
+    >>> mask = active_hits(hit_ids, ed_lookup)
+    >>> hit_ids[mask]     # only IDs that appear in the geometry
+    """
+    hit_ids = np.asarray(hit_ids, dtype=np.int32)
+    in_range = hit_ids < len(lookup)
+    mask = np.zeros(len(hit_ids), dtype=bool)
+    mask[in_range] = lookup[hit_ids[in_range]]
+    return mask
+
+
+def mark_missing_hits(
+    hits: ak.Array,
+    lookup: np.ndarray,
+    absent_status: int = -2,
+) -> ak.Array:
+    """Return a new hit array with *absent_status* written into the ``status``
+    field for detectors that are absent from the loaded geometry.
+
+    .. warning::
+        **Not for use inside the reconstruction pipeline.**
+
+        In the data-driven design, simulation inputs are kept pristine; the
+        geometry filter is applied at numpy-extraction time by composing
+        :func:`active_hits` with the status predicate::
+
+            mask = active_hits(hit_ids, lookup) & (status > 0)
+
+        Use ``mark_missing_hits`` only when you explicitly want to persist a
+        geometry-annotated copy of an event dataset (e.g. for diagnostics or
+        pre-filtering a large file before reconstruction).
+
+    Parameters
+    ----------
+    hits:
+        Ragged hit array (all events) with at least ``id`` and ``status``
+        fields, as returned by :func:`km2arec.io.read_events`.
+    lookup:
+        Boolean lookup array produced by :func:`build_id_lookup` for the
+        same sub-detector (ED or MD).
+    absent_status:
+        Status code to write for geometry-absent hits.  Default: ``-2``,
+        distinct from the existing KM2A codes (5=good, 2/1/0=noise, -1=bad
+        detector).
+
+    Returns
+    -------
+    ak.Array
+        Same structure as ``hits``; ``status`` field overwritten for
+        geometry-absent hits.  All other fields and the ragged structure are
+        preserved unchanged.
+    """
+    counts = ak.num(hits["id"])
+    flat_ids = ak.to_numpy(ak.flatten(hits["id"])).astype(np.int32)
+    in_geo = active_hits(flat_ids, lookup)
+    ragged_in_geo = ak.unflatten(in_geo, counts)
+    new_status = ak.where(ragged_in_geo, hits["status"], absent_status)
+    return ak.with_field(hits, new_status, "status")
+
+
 def load_geometry(
     ed_pos_file: PathLike | None = None,
     md_pos_file: PathLike | None = None,

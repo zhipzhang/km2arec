@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [Phase 2] - 2026-05-13
+
+### Added
+- `km2arec/geometry.py`: detector geometry loader with four public symbols
+  - `GeometryArrays`: plain `NamedTuple` with `ed` and `md` fields, each an `ak.Array` carrying `id`, `x`, `y`, `z` in the CORSIKA coordinate frame
+  - `load_geometry(ed_pos_file=None, md_pos_file=None) -> GeometryArrays`: loads the full KM2A array by default (5216 ED + 1188 MD); accepts optional `str | Path` overrides for sub-array or custom layouts; applies the LHAASO→CORSIKA coordinate transform (`x = lhaaso_y`, `y = −lhaaso_x`, `z = z − zeroZ`) on load
+  - `build_id_lookup(ids) -> np.ndarray[bool]`: builds a O(1) boolean lookup array (length `max_id + 1`) for testing detector presence; built once at startup
+  - `active_hits(hit_ids, lookup) -> np.ndarray[bool]`: pipeline-facing per-event filter; composes with the status predicate (`& (status > 0)`) at numpy-extraction time so simulation inputs are never modified
+  - `mark_missing_hits(hits, lookup, absent_status=-2) -> ak.Array`: opt-in annotation utility (not used by the pipeline) that writes `status = absent_status` for geometry-absent hits across all events; provided for diagnostic/pre-filtering workflows
+- `km2arec/data/ED_pos_all.txt`: bundled full ED array layout (5216 detectors, `Flag==7` in C++ reference)
+- `km2arec/data/MD_pos_all.txt`: bundled full MD array layout (1188 detectors)
+- `tests/test_geometry.py`: 38 tests across six groups — default load counts, CORSIKA coordinate correctness for known detector IDs, external file override, `build_id_lookup` correctness, `active_hits` edge cases, `mark_missing_hits` field and structure preservation
+
+### Changed
+- `km2arec/__init__.py`: exports `GeometryArrays`, `load_geometry`, `build_id_lookup`, `active_hits`, `mark_missing_hits`
+- `pyproject.toml`: added `data/*.txt` to `[tool.setuptools.package-data]` so geometry files are included in the installed package
+- `specs/roadmap.md`: Phase 2 redesigned — drops C++ `arrayflag`, bundles full-array geometry as default, documents LHAASO→CORSIKA file format, clarifies that `active_hits` is the pipeline-facing filter (inputs stay pristine) while `mark_missing_hits` is an explicit opt-in utility; calibration deferred to a later phase
+
 ## [Phase 1] - 2026-05-13
 
 ### Added
