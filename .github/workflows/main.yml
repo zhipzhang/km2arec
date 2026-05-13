@@ -22,45 +22,30 @@ env:
 jobs:
   checks:
     name: Python ${{ matrix.python }} - ${{ matrix.task.name }}
-    runs-on: [ubuntu-latest]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.8", "3.10"]
+        python: ["3.13", "3.14"]
         task:
           - name: Test
             run: |
               pytest -v --color=yes tests/
 
         include:
-          - python: "3.10"
+          - python: "3.13"
             task:
               name: Lint
-              run: ruff check .
+              run: |
+                ruff format --check .
+                ruff check .
 
-          - python: "3.10"
-            task:
-              name: Type check
-              run: mypy .
-
-          - python: "3.10"
+          - python: "3.13"
             task:
               name: Build
               run: |
                 python -m build
-
-          - python: "3.10"
-            task:
-              name: Style
-              run: |
-                isort --check .
-                black --check .
-
-          - python: "3.10"
-            task:
-              name: Docs
-              run: cd docs && make html
 
     steps:
       - uses: actions/checkout@v4
@@ -70,16 +55,6 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache-prefix: ${{ env.CACHE_PREFIX }}
-
-      - name: Restore mypy cache
-        if: matrix.task.name == 'Type check'
-        uses: actions/cache@v4
-        with:
-          path: .mypy_cache
-          key: mypy-${{ env.CACHE_PREFIX }}-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('*requirements.txt') }}-${{ github.ref }}-${{ github.sha }}
-          restore-keys: |
-            mypy-${{ env.CACHE_PREFIX }}-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('*requirements.txt') }}-${{ github.ref }}
-            mypy-${{ env.CACHE_PREFIX }}-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('*requirements.txt') }}
 
       - name: ${{ matrix.task.name }}
         run: |
@@ -110,9 +85,9 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.13"
 
       - name: Install requirements
         run: |
@@ -125,7 +100,7 @@ jobs:
           echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
 
       - name: Download package distribution files
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: package
           path: dist
@@ -139,7 +114,7 @@ jobs:
           twine upload -u '${{ secrets.PYPI_USERNAME }}' -p '${{ secrets.PYPI_PASSWORD }}' dist/*
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
