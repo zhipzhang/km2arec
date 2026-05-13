@@ -1,4 +1,4 @@
-# **my-package**
+# **km2arec**
 
 ```{toctree}
 :maxdepth: 2
@@ -15,8 +15,8 @@ overview
 
 CHANGELOG
 CONTRIBUTING
-License <https://raw.githubusercontent.com/allenai/python-package-template/main/LICENSE>
-GitHub Repository <https://github.com/allenai/python-package-template>
+License <https://raw.githubusercontent.com/allenai/km2arec/main/LICENSE>
+GitHub Repository <https://github.com/zhipzhang/km2arec>
 ```
 
 ## Indices and tables
